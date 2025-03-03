@@ -1,15 +1,14 @@
+# IMPORTS
 import tensorflow as tf
 import tf_keras as keras
 import tensorflow_probability as tfp
 
 from tf_keras.models import Sequential, Model
-from tf_keras.layers import Input, Dense, BatchNormalization, Dropout
+from tf_keras.layers import Input, Dense, BatchNormalization, Dropout, Activation
 from tf_keras.optimizers import SGD, Adam
-import tensorflow_probability as tfp
+from tensorflow_probability.python.layers import DenseVariational
 
 from ray import train
-
-
 
 # Set seed from random number generator, for better comparisons
 from numpy.random import seed
@@ -17,12 +16,42 @@ seed(123)
 
 import matplotlib.pyplot as plt
 
+# CUSTOM PRIOR AND POSTERIOR FUNCTIONS FOR THE VARIATIONAL LAYER
+#  Code from https://keras.io/examples/keras_recipes/bayesian_neural_networks/
+# The prior is defined as a normal distribution with zero mean and unit variance.
+def prior(kernel_size, bias_size, dtype=None):
+    n = kernel_size + bias_size
+    prior_model = keras.Sequential(
+        [
+            tfp.layers.DistributionLambda(
+                lambda t: tfp.distributions.MultivariateNormalDiag(
+                    loc=tf.zeros(n), scale_diag=tf.ones(n)
+                )
+            )
+        ]
+    )
+    return prior_model
+
+
+# multivariate Gaussian distribution parametrized by a learnable parameters.
+def posterior(kernel_size, bias_size, dtype=None):
+    n = kernel_size + bias_size
+    posterior_model = keras.Sequential(
+        [
+            tfp.layers.VariableLayer(
+                tfp.layers.MultivariateNormalTriL.params_size(n), dtype=dtype
+            ),
+            tfp.layers.MultivariateNormalTriL(n),
+        ]
+    )
+    return posterior_model
+
 # =======================================
 # DNN related function
 # =======================================
 # DEEP LEARNING MODEL BUILD FUNCTION
 def build_DNN(input_shape, n_hidden_layers, n_hidden_units, loss, act_fun='sigmoid', optimizer:str='sgd', learning_rate=0.01, 
-            use_bn=False, use_dropout=False, use_custom_dropout=False, print_summary=False, use_variational_layer=False):
+            use_bn=False, use_dropout=False, use_custom_dropout=False, print_summary=False, use_variational_layer=False, kl_weight=None):
     """
     Builds a Deep Neural Network (DNN) model based on the provided parameters.
     
@@ -37,7 +66,6 @@ def build_DNN(input_shape, n_hidden_layers, n_hidden_units, loss, act_fun='sigmo
     use_bn (bool, optional): Whether to use Batch Normalization after each layer. Default is False.
     use_dropout (bool, optional): Whether to use Dropout after each layer. Default is False.
     use_custom_dropout (bool, optional): Whether to use a custom Dropout implementation. Default is False.
-
     
     Returns:
     model (Sequential): Compiled Keras Sequential model.
@@ -47,10 +75,11 @@ def build_DNN(input_shape, n_hidden_layers, n_hidden_units, loss, act_fun='sigmo
     # === Your code here =========================
     # --------------------------------------------      
     # Setup optimizer, depending on input parameter string
+    
     if optimizer.lower() == 'sgd':
-        optimizer =SGD(learning_rate=learning_rate)
+        optimizer = SGD(learning_rate = learning_rate)
     elif optimizer.lower() == 'adam':
-        optimizer =Adam(learning_rate=learning_rate)
+        optimizer = Adam(learning_rate = learning_rate)
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer}")
 
@@ -65,30 +94,40 @@ def build_DNN(input_shape, n_hidden_layers, n_hidden_units, loss, act_fun='sigmo
     # Add layers to the model, using the input parameters of the build_DNN function
     
     # Add first (Input) layer, requires input shape
-    model.add(Input(shape=input_shape))
+    model.add(Input(shape = input_shape))
+
     #check if we use batch normalization
     if use_bn:
         model.add(BatchNormalization())
-
-
-
+    
     # Add remaining layers. These to not require the input shape since it will be infered during model compile
     for _ in range(n_hidden_layers):
-        model.add(Dense(units=n_hidden_units, activation=act_fun))
-         #check if we use batch normalization
+        
+        # check if we use_variational_layer
+        if use_variational_layer:
+            model.add(DenseVariational(units = n_hidden_units, kl_weight = kl_weight, make_prior_fn = prior, make_posterior_fn = posterior))
+        else:
+            model.add(Dense(units = n_hidden_units))
+            
+        #check if we use batch normalization
         if use_bn:
             model.add(BatchNormalization())
+
+        # apply activation function
+        model.add(Activation(act_fun))
+
+        # check if we use dropout
         if use_dropout:
             model.add(Dropout(0.5))
+        if use_custom_dropout:
+            model.add(myDropout(0.5))
+        
 
     # Add final layer
-    model.add(Dense(1,activation="sigmoid"))
+    model.add(Dense(units = 1, activation = "sigmoid"))
     
     # Compile model
-    model.compile(loss=loss, optimizer=optimizer, metrics=['accuracy'])
-
-
-
+    model.compile(loss = loss, optimizer = optimizer, metrics = ['accuracy'])
 
     # ============================================
     # Print model summary if requested
@@ -135,17 +174,17 @@ def train_DNN(config, training_config):
     model = build_DNN(**config)
 
     #check if class_weight is provided
-    if"class_weight" in training_config and training_config["class_weight"] is not None:
+    if "class_weight" in training_config and training_config["class_weight"] is not None:
         class_weight = training_config["class_weight"]
     else:
         class_weight = None
-
-
-
-
+        
     # Train the model (no need to save the history, as the callback will log the results).
     # Remember to add the TuneReporterCallback() to the list of callbacks.
-    return(model.fit(X_train,y_train,batch_size=training_config["batch_size"], validation_data=(X_val , y_val),epochs=training_config["epochs"],class_weight=class_weight, callbacks=[TuneReporterCallback()]))
+    history = model.fit(X_train, y_train, batch_size = training_config["batch_size"], epochs = training_config["epochs"], class_weight=class_weight,
+                verbose = 2, validation_data = (X_val, y_val), callbacks = TuneReporterCallback())
+
+    return {"history": history}
 
     # --------------------------------------------
 
